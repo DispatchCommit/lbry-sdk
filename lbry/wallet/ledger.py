@@ -576,11 +576,9 @@ class Ledger(metaclass=LedgerRegistry):
                     log.warning("lock was already released?")
                     pass
 
-            log.info("updating address count and status")
             await self.db.save_transaction_io_batch(
                 [], address, self.address_to_hash160(address), synced_history
             )
-            log.info("updated address count and status")
 
             if address_manager is None:
                 address_manager = await self.get_address_manager_for_address(address)
@@ -682,13 +680,15 @@ class Ledger(metaclass=LedgerRegistry):
         batches = [[]]
         remote_heights = {}
         synced_txs = []
-        heights_in_batch = 1
+        heights_in_batch = 0
+        last_height = 0
         for idx in sorted(to_request):
             txid = to_request[idx][0]
             height = to_request[idx][1]
             remote_heights[txid] = height
-            if idx > 1 and height != remote_heights[batches[-1][-1]]:
+            if height != last_height:
                 heights_in_batch += 1
+            last_height = height
             if len(batches[-1]) == 100 or heights_in_batch == 10:
                 batches.append([])
                 heights_in_batch = 1
@@ -728,10 +728,8 @@ class Ledger(metaclass=LedgerRegistry):
                         continue
                     cache_item = self._tx_cache.get(txi.txo_ref.tx_ref.id)
                     if cache_item is not None:
-                        if cache_item.tx is None:
-                            await cache_item.has_tx.wait()
-                        assert cache_item.tx is not None
-                        txi.txo_ref = cache_item.tx.outputs[txi.txo_ref.position].ref
+                        if cache_item.tx is not None:
+                            txi.txo_ref = cache_item.tx.outputs[txi.txo_ref.position].ref
                     else:
                         check_db_for_txos.append(txi.txo_ref.id)
 
@@ -740,12 +738,20 @@ class Ledger(metaclass=LedgerRegistry):
                         txoid__in=check_db_for_txos, order_by='txo.txoid', no_tx=True
                     )
                 }
+
                 for txi in tx.inputs:
                     if txi.txo_ref.txo is not None:
                         continue
                     referenced_txo = referenced_txos.get(txi.txo_ref.id)
                     if referenced_txo is not None:
                         txi.txo_ref = referenced_txo.ref
+                        continue
+                    cache_item = self._tx_cache.get(txi.txo_ref.id)
+                    if cache_item is None:
+                        cache_item = self._tx_cache[txi.txo_ref.id] = TransactionCacheItem()
+                    if cache_item.tx is not None:
+                        txi.txo_ref = cache_item.tx.ref
+
                 synced_txs.append(tx)
                 this_batch_synced.append(tx)
             await self.db.save_transaction_io_batch(
@@ -760,9 +766,14 @@ class Ledger(metaclass=LedgerRegistry):
                 log.info("synced %i/%i transactions for %s", len(synced_txs), remote_history_size, address)
                 last_showed_synced_count = len(synced_txs)
 
-        await asyncio.wait(
-            [_single_batch(batch) for batch in batches]
-        )
+        tasks = []
+        for batch in batches:
+            tasks.append(asyncio.create_task(_single_batch(batch)))
+            if len(tasks) == 10:
+                await asyncio.wait(tasks)
+                tasks.clear()
+        if tasks:
+            await asyncio.wait(tasks)
         log.info("finished syncing history for %s", address)
         return synced_txs
 
