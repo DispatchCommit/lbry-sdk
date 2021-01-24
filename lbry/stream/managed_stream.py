@@ -354,12 +354,24 @@ class ManagedStream(ManagedDownloadSource):
                 self.reflector_progress = int((i + 1) / len(we_have) * 100)
         except (asyncio.TimeoutError, ValueError):
             return sent
-        except ConnectionRefusedError:
+        except ConnectionError:
+            return sent
+        except (OSError, Exception) as err:
+            if isinstance(err, asyncio.CancelledError):
+                log.warning("stopped uploading %s#%s to reflector", self.claim_name, self.claim_id)
+            elif isinstance(err, OSError):
+                log.warning(
+                    "stopped uploading %s#%s to reflector because blobs were deleted or moved", self.claim_name,
+                    self.claim_id
+                )
+            else:
+                log.exception("unexpected error reflecting %s#%s", self.claim_name, self.claim_id)
             return sent
         finally:
             if protocol.transport:
                 protocol.transport.close()
             self.uploading_to_reflector = False
+
         if not self.fully_reflected.is_set():
             self.fully_reflected.set()
             await self.blob_manager.storage.update_reflected_stream(self.sd_hash, f"{host}:{port}")

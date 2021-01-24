@@ -6,6 +6,7 @@ from binascii import unhexlify
 from urllib.request import urlopen
 
 from lbry.error import InsufficientFundsError
+from lbry.extras.daemon.comment_client import verify
 
 from lbry.extras.daemon.daemon import DEFAULT_PAGE_SIZE
 from lbry.testcase import CommandTestCase
@@ -89,7 +90,7 @@ class ClaimSearchCommand(ClaimTestCase):
         # 23829 claim ids makes the request just large enough
         claim_ids = [
             '0000000000000000000000000000000000000000',
-        ] * 23829
+        ] * 33829
         with self.assertRaises(ConnectionResetError):
             await self.claim_search(claim_ids=claim_ids)
 
@@ -262,6 +263,19 @@ class ClaimSearchCommand(ClaimTestCase):
         await self.assertFindsClaims([claim4, claim3, claim2], fee_amount='<1.0', fee_currency='lbc')
         await self.assertFindsClaims([claim3], fee_amount='0.5', fee_currency='lbc')
         await self.assertFindsClaims([claim5], fee_currency='usd')
+
+    async def test_search_by_language(self):
+        claim1 = await self.stream_create('claim1', fee_amount='1.0', fee_currency='lbc')
+        claim2 = await self.stream_create('claim2', fee_amount='0.9', fee_currency='lbc')
+        claim3 = await self.stream_create('claim3', fee_amount='0.5', fee_currency='lbc', languages='en')
+        claim4 = await self.stream_create('claim4', fee_amount='0.1', fee_currency='lbc', languages='en')
+        claim5 = await self.stream_create('claim5', fee_amount='1.0', fee_currency='usd', languages='es')
+
+        await self.assertFindsClaims([claim4, claim3], any_languages=['en'])
+        await self.assertFindsClaims([claim2, claim1], any_languages=['none'])
+        await self.assertFindsClaims([claim4, claim3, claim2, claim1], any_languages=['none', 'en'])
+        await self.assertFindsClaims([claim5], any_languages=['es'])
+        await self.assertFindsClaims([claim5, claim4, claim3], any_languages=['en', 'es'])
         await self.assertFindsClaims([], fee_currency='foo')
 
     async def test_search_by_channel(self):
@@ -318,6 +332,25 @@ class ClaimSearchCommand(ClaimTestCase):
         await match([claim3, claim2],
                     not_channel_ids=[chan2_id], has_channel_signature=True, valid_channel_signature=True)
         await match([], not_channel_ids=[chan1_id, chan2_id], has_channel_signature=True, valid_channel_signature=True)
+
+    async def test_limit_claims_per_channel(self):
+        match = self.assertFindsClaims
+        chan1_id = self.get_claim_id(await self.channel_create('@chan1'))
+        chan2_id = self.get_claim_id(await self.channel_create('@chan2'))
+        claim1 = await self.stream_create('claim1')
+        claim2 = await self.stream_create('claim2', channel_id=chan1_id)
+        claim3 = await self.stream_create('claim3', channel_id=chan1_id)
+        claim4 = await self.stream_create('claim4', channel_id=chan1_id)
+        claim5 = await self.stream_create('claim5', channel_id=chan2_id)
+        claim6 = await self.stream_create('claim6', channel_id=chan2_id)
+        await match(
+            [claim6, claim5, claim4, claim3, claim1],
+            limit_claims_per_channel=2, claim_type='stream'
+        )
+        await match(
+            [claim6, claim5, claim4, claim3, claim2, claim1],
+            limit_claims_per_channel=3, claim_type='stream'
+        )
 
     async def test_claim_type_and_media_type_search(self):
         # create an invalid/unknown claim
@@ -427,6 +460,29 @@ class TransactionCommands(ClaimTestCase):
 
 
 class TransactionOutputCommands(ClaimTestCase):
+
+    async def test_txo_list_by_channel_filtering(self):
+        channel_foo = self.get_claim_id(await self.channel_create('@foo'))
+        channel_bar = self.get_claim_id(await self.channel_create('@bar'))
+        stream_a = self.get_claim_id(await self.stream_create('a', channel_id=channel_foo))
+        stream_b = self.get_claim_id(await self.stream_create('b', channel_id=channel_foo))
+        stream_c = self.get_claim_id(await self.stream_create('c', channel_id=channel_bar))
+        stream_d = self.get_claim_id(await self.stream_create('d'))
+
+        r = await self.txo_list(type='stream')
+        self.assertEqual({stream_a, stream_b, stream_c, stream_d}, {c['claim_id'] for c in r})
+
+        r = await self.txo_list(type='stream', channel_id=channel_foo)
+        self.assertEqual({stream_a, stream_b}, {c['claim_id'] for c in r})
+
+        r = await self.txo_list(type='stream', channel_id=[channel_foo, channel_bar])
+        self.assertEqual({stream_a, stream_b, stream_c}, {c['claim_id'] for c in r})
+
+        r = await self.txo_list(type='stream', not_channel_id=channel_foo)
+        self.assertEqual({stream_c, stream_d}, {c['claim_id'] for c in r})
+
+        r = await self.txo_list(type='stream', not_channel_id=[channel_foo, channel_bar])
+        self.assertEqual({stream_d}, {c['claim_id'] for c in r})
 
     async def test_txo_list_and_sum_filtering(self):
         channel_id = self.get_claim_id(await self.channel_create())
@@ -971,6 +1027,18 @@ class ChannelCommands(CommandTestCase):
         self.assertItemCount(await self.daemon.jsonrpc_channel_list(), 3)
         self.assertItemCount(await self.daemon.jsonrpc_channel_list(account_id=self.account.id), 2)
         self.assertItemCount(await self.daemon.jsonrpc_channel_list(account_id=account2_id), 1)
+
+    async def test_sign_hex_encoded_data(self):
+        data_to_sign = "CAFEBABE"
+        # claim new name
+        await self.channel_create('@someotherchan')
+        channel_tx = await self.daemon.jsonrpc_channel_create('@signer', '0.1')
+        await self.confirm_tx(channel_tx.id)
+        channel = channel_tx.outputs[0]
+        signature1 = await self.out(self.daemon.jsonrpc_channel_sign(channel_name='@signer', hexdata=data_to_sign))
+        signature2 = await self.out(self.daemon.jsonrpc_channel_sign(channel_id=channel.claim_id, hexdata=data_to_sign))
+        self.assertTrue(verify(channel, unhexlify(data_to_sign), signature1))
+        self.assertTrue(verify(channel, unhexlify(data_to_sign), signature2))
 
     async def test_channel_export_import_before_sending_channel(self):
         # export

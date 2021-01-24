@@ -21,6 +21,7 @@ import base58
 from aiohttp import web
 from prometheus_client import generate_latest as prom_generate_latest, Gauge, Histogram, Counter
 from google.protobuf.message import DecodeError
+
 from lbry.wallet import (
     Wallet, ENCRYPT_ON_DISK, SingleKey, HierarchicalDeterministic,
     Transaction, Output, Input, Account, database
@@ -557,6 +558,14 @@ class Daemon(metaclass=JSONRPCServerType):
                 await self.component_manager.stop()
             else:
                 self.component_startup_task.cancel()
+                # the wallet component might have not started
+                try:
+                    wallet_component = self.component_manager.get_actual_component('wallet')
+                except NameError:
+                    pass
+                else:
+                    await wallet_component.stop()
+                await self.component_manager.stop()
         log.info("stopped api components")
         await self.rpc_runner.cleanup()
         await self.streaming_runner.cleanup()
@@ -986,10 +995,12 @@ class Daemon(metaclass=JSONRPCServerType):
                     [--include_sent_supports]
                     [--include_sent_tips]
                     [--include_received_tips]
+                    [--new_sdk_server=<new_sdk_server>]
 
         Options:
             --urls=<urls>              : (str, list) one or more urls to resolve
             --wallet_id=<wallet_id>    : (str) wallet to check for claim purchase reciepts
+           --new_sdk_server=<new_sdk_server> : (str) URL of the new SDK server (EXPERIMENTAL)
            --include_purchase_receipt  : (bool) lookup and include a receipt if this wallet
                                                 has purchased the claim being resolved
             --include_is_my_output     : (bool) lookup and include a boolean indicating
@@ -1714,7 +1725,7 @@ class Daemon(metaclass=JSONRPCServerType):
             change_made = True
 
         if change_made:
-            account.modified_on = time.time()
+            account.modified_on = int(time.time())
             wallet.save()
 
         return account
@@ -2293,6 +2304,41 @@ class Daemon(metaclass=JSONRPCServerType):
             kwargs['is_not_spent'] = True
         return self.jsonrpc_txo_list(**kwargs)
 
+    async def jsonrpc_support_sum(self, claim_id, new_sdk_server, include_channel_content=False, **kwargs):
+        """
+        List total staked supports for a claim, grouped by the channel that signed the support.
++
++       If claim_id is a channel claim, you can use --include_channel_content to also include supports for
++       content claims in the channel.
+
+        !!!! NOTE: PAGINATION DOES NOT DO ANYTHING AT THE MOMENT !!!!!
+
+        Usage:
+            support_sum <claim_id> <new_sdk_server>
+                         [--include_channel_content]
+                         [--page=<page>] [--page_size=<page_size>]
+
+        Options:
+            --claim_id=<claim_id>             : (str)  claim id
+            --new_sdk_server=<new_sdk_server> : (str)  URL of the new SDK server (EXPERIMENTAL)
+            --include_channel_content         : (bool) if claim_id is for a channel, include supports for claims in
+                                                       that channel
+            --page=<page>                     : (int)  page to return during paginating
+            --page_size=<page_size>           : (int)  number of items on page during pagination
+
+        Returns: {Paginated[Dict]}
+        """
+        page_num, page_size = abs(kwargs.pop('page', 1)), min(abs(kwargs.pop('page_size', DEFAULT_PAGE_SIZE)), 50)
+        kwargs.update({'offset': page_size * (page_num - 1), 'limit': page_size})
+        support_sums = await self.ledger.sum_supports(
+            new_sdk_server, claim_id=claim_id, include_channel_content=include_channel_content, **kwargs
+        )
+        return {
+            "items": support_sums,
+            "page": page_num,
+            "page_size": page_size
+        }
+
     @requires(WALLET_COMPONENT)
     async def jsonrpc_claim_search(self, **kwargs):
         """
@@ -2308,6 +2354,7 @@ class Daemon(metaclass=JSONRPCServerType):
                          [--channel=<channel> |
                              [[--channel_ids=<channel_ids>...] [--not_channel_ids=<not_channel_ids>...]]]
                          [--has_channel_signature] [--valid_channel_signature | --invalid_channel_signature]
+                         [--limit_claims_per_channel=<limit_claims_per_channel>]
                          [--is_controlling] [--release_time=<release_time>] [--public_key_id=<public_key_id>]
                          [--timestamp=<timestamp>] [--creation_timestamp=<creation_timestamp>]
                          [--height=<height>] [--creation_height=<creation_height>]
@@ -2327,6 +2374,7 @@ class Daemon(metaclass=JSONRPCServerType):
                          [--not_locations=<not_locations>...]
                          [--order_by=<order_by>...] [--page=<page>] [--page_size=<page_size>]
                          [--wallet_id=<wallet_id>] [--include_purchase_receipt] [--include_is_my_output]
+                         [--new_sdk_server=<new_sdk_server>]
 
         Options:
             --name=<name>                   : (str) claim name (normalized)
@@ -2355,6 +2403,8 @@ class Daemon(metaclass=JSONRPCServerType):
             --invalid_channel_signature     : (bool) claims with invalid channel signature or no signature,
                                                      use in conjunction with --has_channel_signature to
                                                      only get claims with invalid signatures
+            --limit_claims_per_channel=<limit_claims_per_channel>: (int) only return up to the specified
+                                                                         number of claims per channel
             --is_controlling                : (bool) winning claims of their respective name
             --public_key_id=<public_key_id> : (str) only return channels having this public key id, this is
                                                     the same key as used in the wallet file to map
@@ -2432,6 +2482,7 @@ class Daemon(metaclass=JSONRPCServerType):
                                                      has purchased the claim
             --include_is_my_output          : (bool) lookup and include a boolean indicating
                                                      if claim being resolved is yours
+           --new_sdk_server=<new_sdk_server> : (str) URL of the new SDK server (EXPERIMENTAL)
 
         Returns: {Paginated[Output]}
         """
@@ -2737,6 +2788,34 @@ class Daemon(metaclass=JSONRPCServerType):
             await account.ledger.release_tx(tx)
 
         return tx
+
+    @requires(WALLET_COMPONENT)
+    async def jsonrpc_channel_sign(
+            self, channel_name=None, channel_id=None, hexdata=None, channel_account_id=None, wallet_id=None):
+        """
+        Signs data using the specified channel signing key.
+
+        Usage:
+            channel_sign [<channel_name> | --channel_name=<channel_name>]
+                         [<channel_id> | --channel_id=<channel_id>] [<hexdata> | --hexdata=<hexdata>]
+                         [--channel_account_id=<channel_account_id>...] [--wallet_id=<wallet_id>]
+
+        Options:
+            --channel_name=<channel_name>            : (str) name of channel used to sign (or use channel id)
+            --channel_id=<channel_id>                : (str) claim id of channel used to sign (or use channel name)
+            --hexdata=<hexdata>                      : (str) data to sign, encoded as hexadecimal
+            --channel_account_id=<channel_account_id>: (str) one or more account ids for accounts to look in
+                                                             for channel certificates, defaults to all accounts.
+            --wallet_id=<wallet_id>                  : (str) restrict operation to specific wallet
+
+        Returns: {}
+        """
+        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
+        assert not wallet.is_locked, "Cannot spend funds with locked wallet, unlock first."
+        signing_channel = await self.get_channel_or_error(
+            wallet, channel_account_id, channel_id, channel_name, for_signing=True
+        )
+        return comment_client.sign(signing_channel, unhexlify(hexdata))
 
     @requires(WALLET_COMPONENT)
     async def jsonrpc_channel_abandon(
@@ -4263,7 +4342,8 @@ class Daemon(metaclass=JSONRPCServerType):
     @staticmethod
     def _constrain_txo_from_kwargs(
             constraints, type=None, txid=None,  # pylint: disable=redefined-builtin
-            claim_id=None, channel_id=None, name=None, reposted_claim_id=None,
+            claim_id=None, channel_id=None, not_channel_id=None,
+            name=None, reposted_claim_id=None,
             is_spent=False, is_not_spent=False,
             is_my_input_or_output=None, exclude_internal_transfers=False,
             is_my_output=None, is_not_my_output=None,
@@ -4286,6 +4366,7 @@ class Daemon(metaclass=JSONRPCServerType):
                 constraints['is_my_output'] = False
         database.constrain_single_or_list(constraints, 'txo_type', type, lambda x: TXO_TYPES[x])
         database.constrain_single_or_list(constraints, 'channel_id', channel_id)
+        database.constrain_single_or_list(constraints, 'channel_id', not_channel_id, negate=True)
         database.constrain_single_or_list(constraints, 'claim_id', claim_id)
         database.constrain_single_or_list(constraints, 'claim_name', name)
         database.constrain_single_or_list(constraints, 'txid', txid)
@@ -4300,9 +4381,9 @@ class Daemon(metaclass=JSONRPCServerType):
         List my transaction outputs.
 
         Usage:
-            txo_list [--account_id=<account_id>] [--type=<type>...] [--txid=<txid>...]
-                     [--claim_id=<claim_id>...] [--channel_id=<channel_id>...] [--name=<name>...]
-                     [--is_spent | --is_not_spent]
+            txo_list [--account_id=<account_id>] [--type=<type>...] [--txid=<txid>...] [--claim_id=<claim_id>...]
+                     [--channel_id=<channel_id>...] [--not_channel_id=<not_channel_id>...]
+                     [--name=<name>...] [--is_spent | --is_not_spent]
                      [--is_my_input_or_output |
                          [[--is_my_output | --is_not_my_output] [--is_my_input | --is_not_my_input]]
                      ]
@@ -4316,6 +4397,7 @@ class Daemon(metaclass=JSONRPCServerType):
             --txid=<txid>              : (str or list) transaction id of outputs
             --claim_id=<claim_id>      : (str or list) claim id
             --channel_id=<channel_id>  : (str or list) claims in this channel
+      --not_channel_id=<not_channel_id>: (str or list) claims not in this channel
             --name=<name>              : (str or list) claim name
             --is_spent                 : (bool) only show spent txos
             --is_not_spent             : (bool) only show not spent txos
@@ -4375,9 +4457,9 @@ class Daemon(metaclass=JSONRPCServerType):
         Spend transaction outputs, batching into multiple transactions as necessary.
 
         Usage:
-            txo_spend [--account_id=<account_id>] [--type=<type>...] [--txid=<txid>...]
-                      [--claim_id=<claim_id>...] [--channel_id=<channel_id>...] [--name=<name>...]
-                      [--is_my_input | --is_not_my_input]
+            txo_spend [--account_id=<account_id>] [--type=<type>...] [--txid=<txid>...] [--claim_id=<claim_id>...]
+                      [--channel_id=<channel_id>...] [--not_channel_id=<not_channel_id>...]
+                      [--name=<name>...] [--is_my_input | --is_not_my_input]
                       [--exclude_internal_transfers] [--wallet_id=<wallet_id>]
                       [--preview] [--blocking] [--batch_size=<batch_size>] [--include_full_tx]
 
@@ -4387,6 +4469,7 @@ class Daemon(metaclass=JSONRPCServerType):
             --txid=<txid>              : (str or list) transaction id of outputs
             --claim_id=<claim_id>      : (str or list) claim id
             --channel_id=<channel_id>  : (str or list) claims in this channel
+      --not_channel_id=<not_channel_id>: (str or list) claims not in this channel
             --name=<name>              : (str or list) claim name
             --is_my_input              : (bool) show outputs created by you
             --is_not_my_input          : (bool) show outputs not created by you
@@ -4431,6 +4514,7 @@ class Daemon(metaclass=JSONRPCServerType):
 
         Usage:
             txo_list [--account_id=<account_id>] [--type=<type>...] [--txid=<txid>...]
+                     [--channel_id=<channel_id>...] [--not_channel_id=<not_channel_id>...]
                      [--claim_id=<claim_id>...] [--name=<name>...]
                      [--is_spent] [--is_not_spent]
                      [--is_my_input_or_output |
@@ -4444,6 +4528,8 @@ class Daemon(metaclass=JSONRPCServerType):
             --txid=<txid>              : (str or list) transaction id of outputs
             --claim_id=<claim_id>      : (str or list) claim id
             --name=<name>              : (str or list) claim name
+            --channel_id=<channel_id>  : (str or list) claims in this channel
+      --not_channel_id=<not_channel_id>: (str or list) claims not in this channel
             --is_spent                 : (bool) only show spent txos
             --is_not_spent             : (bool) only show not spent txos
             --is_my_input_or_output    : (bool) txos which have your inputs or your outputs,
@@ -4478,6 +4564,7 @@ class Daemon(metaclass=JSONRPCServerType):
         Usage:
             txo_plot [--account_id=<account_id>] [--type=<type>...] [--txid=<txid>...]
                      [--claim_id=<claim_id>...] [--name=<name>...] [--is_spent] [--is_not_spent]
+                     [--channel_id=<channel_id>...] [--not_channel_id=<not_channel_id>...]
                      [--is_my_input_or_output |
                          [[--is_my_output | --is_not_my_output] [--is_my_input | --is_not_my_input]]
                      ]
@@ -4492,6 +4579,8 @@ class Daemon(metaclass=JSONRPCServerType):
             --txid=<txid>              : (str or list) transaction id of outputs
             --claim_id=<claim_id>      : (str or list) claim id
             --name=<name>              : (str or list) claim name
+            --channel_id=<channel_id>  : (str or list) claims in this channel
+      --not_channel_id=<not_channel_id>: (str or list) claims not in this channel
             --is_spent                 : (bool) only show spent txos
             --is_not_spent             : (bool) only show not spent txos
             --is_my_input_or_output    : (bool) txos which have your inputs or your outputs,
@@ -4989,10 +5078,9 @@ class Daemon(metaclass=JSONRPCServerType):
     View, create and abandon comments.
     """
 
-    @requires(WALLET_COMPONENT)
     async def jsonrpc_comment_list(self, claim_id, parent_id=None, page=1, page_size=50,
-                                   include_replies=True, is_channel_signature_valid=False,
-                                   hidden=False, visible=False):
+                                   include_replies=False, skip_validation=False,
+                                   is_channel_signature_valid=False, hidden=False, visible=False):
         """
         List comments associated with a claim.
 
@@ -5000,7 +5088,7 @@ class Daemon(metaclass=JSONRPCServerType):
             comment_list    (<claim_id> | --claim_id=<claim_id>)
                             [(--page=<page> --page_size=<page_size>)]
                             [--parent_id=<parent_id>] [--include_replies]
-                            [--is_channel_signature_valid]
+                            [--skip_validation] [--is_channel_signature_valid]
                             [--visible | --hidden]
 
         Options:
@@ -5008,6 +5096,7 @@ class Daemon(metaclass=JSONRPCServerType):
             --parent_id=<parent_id>         : (str) CommentId of a specific thread you'd like to see
             --page=<page>                   : (int) The page you'd like to see in the comment list.
             --page_size=<page_size>         : (int) The amount of comments that you'd like to retrieve
+            --skip_validation               : (bool) Skip resolving comments to validate channel names
             --include_replies               : (bool) Whether or not you want to include replies in list
             --is_channel_signature_valid    : (bool) Only include comments with valid signatures.
                                               [Warning: Paginated total size will not change, even
@@ -5041,8 +5130,9 @@ class Daemon(metaclass=JSONRPCServerType):
         if hidden ^ visible:
             result = await comment_client.jsonrpc_post(
                 self.conf.comment_server,
-                'get_claim_hidden_comments',
+                'comment.List',
                 claim_id=claim_id,
+                visible=visible,
                 hidden=hidden,
                 page=page,
                 page_size=page_size
@@ -5050,28 +5140,29 @@ class Daemon(metaclass=JSONRPCServerType):
         else:
             result = await comment_client.jsonrpc_post(
                 self.conf.comment_server,
-                'get_claim_comments',
+                'comment.List',
                 claim_id=claim_id,
                 parent_id=parent_id,
                 page=page,
                 page_size=page_size,
                 top_level=not include_replies
             )
-        for comment in result.get('items', []):
-            channel_url = comment.get('channel_url')
-            if not channel_url:
-                continue
-            resolve_response = await self.resolve([], [channel_url])
-            if isinstance(resolve_response[channel_url], Output):
-                comment['is_channel_signature_valid'] = comment_client.is_comment_signed_by_channel(
-                    comment, resolve_response[channel_url]
-                )
-            else:
-                comment['is_channel_signature_valid'] = False
-        if is_channel_signature_valid:
-            result['items'] = [
-                c for c in result.get('items', []) if c.get('is_channel_signature_valid', False)
-            ]
+        if not skip_validation:
+            for comment in result.get('items', []):
+                channel_url = comment.get('channel_url')
+                if not channel_url:
+                    continue
+                resolve_response = await self.resolve([], [channel_url])
+                if isinstance(resolve_response[channel_url], Output):
+                    comment['is_channel_signature_valid'] = comment_client.is_comment_signed_by_channel(
+                        comment, resolve_response[channel_url]
+                    )
+                else:
+                    comment['is_channel_signature_valid'] = False
+            if is_channel_signature_valid:
+                result['items'] = [
+                    c for c in result.get('items', []) if c.get('is_channel_signature_valid', False)
+                ]
         return result
 
     @requires(WALLET_COMPONENT)
@@ -5082,7 +5173,7 @@ class Daemon(metaclass=JSONRPCServerType):
 
         Usage:
             comment_create  (<comment> | --comment=<comment>)
-                            (<claim_id> | --claim_id=<claim_id> | --parent_id=<parent_id>)
+                            (<claim_id> | --claim_id=<claim_id>) [--parent_id=<parent_id>]
                             (--channel_id=<channel_id> | --channel_name=<channel_name>)
                             [--channel_account_id=<channel_account_id>...] [--wallet_id=<wallet_id>]
 
@@ -5101,8 +5192,10 @@ class Daemon(metaclass=JSONRPCServerType):
             {
                 "comment":      (str) The actual string as inputted by the user,
                 "comment_id":   (str) The Comment's unique identifier,
+                "claim_id":     (str) The claim commented on,
                 "channel_name": (str) Name of the channel this was posted under, prepended with a '@',
                 "channel_id":   (str) The Channel Claim ID that this comment was posted under,
+                "is_pinned":    (boolean) Channel owner has pinned this comment,
                 "signature":    (str) The signature of the comment,
                 "signing_ts":   (str) The timestamp used to sign the comment,
                 "channel_url":  (str) Channel's URI in the ClaimTrie,
@@ -5124,7 +5217,7 @@ class Daemon(metaclass=JSONRPCServerType):
         }
         comment_client.sign_comment(comment_body, channel)
 
-        response = await comment_client.jsonrpc_post(self.conf.comment_server, 'create_comment', comment_body)
+        response = await comment_client.jsonrpc_post(self.conf.comment_server, 'comment.Create', comment_body)
         response.update({
             'is_claim_signature_valid': comment_client.is_comment_signed_by_channel(response, channel)
         })
@@ -5150,18 +5243,20 @@ class Daemon(metaclass=JSONRPCServerType):
             {
                 "comment":      (str) The actual string as inputted by the user,
                 "comment_id":   (str) The Comment's unique identifier,
+                "claim_id":     (str) The claim commented on,
                 "channel_name": (str) Name of the channel this was posted under, prepended with a '@',
                 "channel_id":   (str) The Channel Claim ID that this comment was posted under,
                 "signature":    (str) The signature of the comment,
                 "signing_ts":   (str) Timestamp used to sign the most recent signature,
                 "channel_url":  (str) Channel's URI in the ClaimTrie,
+                "is_pinned":    (boolean) Channel owner has pinned this comment,
                 "parent_id":    (str) Comment this is replying to, (None) if this is the root,
                 "timestamp":    (int) The time at which comment was entered into the server at, in nanoseconds.
             }
         """
         channel = await comment_client.jsonrpc_post(
             self.conf.comment_server,
-            'get_channel_from_comment_id',
+            'comment.GetChannelFromCommentID',
             comment_id=comment_id
         )
         if 'error' in channel:
@@ -5178,7 +5273,7 @@ class Daemon(metaclass=JSONRPCServerType):
         }
         comment_client.sign_comment(edited_comment, channel_claim)
         return await comment_client.jsonrpc_post(
-            self.conf.comment_server, 'edit_comment', edited_comment
+            self.conf.comment_server, 'comment.Edit', edited_comment
         )
 
     @requires(WALLET_COMPONENT)
@@ -5204,7 +5299,7 @@ class Daemon(metaclass=JSONRPCServerType):
         wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
         abandon_comment_body = {'comment_id': comment_id}
         channel = await comment_client.jsonrpc_post(
-            self.conf.comment_server, 'get_channel_from_comment_id', comment_id=comment_id
+            self.conf.comment_server, 'comment.GetChannelFromCommentID', comment_id=comment_id
         )
         if 'error' in channel:
             return {comment_id: {'abandoned': False}}
@@ -5213,8 +5308,8 @@ class Daemon(metaclass=JSONRPCServerType):
             'channel_id': channel.claim_id,
             'channel_name': channel.claim_name,
         })
-        comment_client.sign_comment(abandon_comment_body, channel, abandon=True)
-        return await comment_client.jsonrpc_post(self.conf.comment_server, 'abandon_comment', abandon_comment_body)
+        comment_client.sign_comment(abandon_comment_body, channel, sign_comment_id=True)
+        return await comment_client.jsonrpc_post(self.conf.comment_server, 'comment.Abandon', abandon_comment_body)
 
     @requires(WALLET_COMPONENT)
     async def jsonrpc_comment_hide(self, comment_ids: typing.Union[str, list], wallet_id=None):
@@ -5258,9 +5353,159 @@ class Daemon(metaclass=JSONRPCServerType):
                     for_signing=True
                 )
                 piece = {'comment_id': comment['comment_id']}
-                comment_client.sign_comment(piece, channel, abandon=True)
+                comment_client.sign_comment(piece, channel, sign_comment_id=True)
                 pieces.append(piece)
-        return await comment_client.jsonrpc_post(self.conf.comment_server, 'hide_comments', pieces=pieces)
+        return await comment_client.jsonrpc_post(self.conf.comment_server, 'comment.Hide', pieces=pieces)
+
+    @requires(WALLET_COMPONENT)
+    async def jsonrpc_comment_pin(self, comment_id=None, channel_id=None, channel_name=None,
+                                  channel_account_id=None, remove=False, wallet_id=None):
+        """
+        Pin a comment published to a claim you control.
+
+        Usage:
+            comment_pin     (<comment_id> | --comment_id=<comment_id>)
+                            (--channel_id=<channel_id>)
+                            (--channel_name=<channel_name>)
+                            [--remove]
+                            [--channel_account_id=<channel_account_id>...] [--wallet_id=<wallet_id>]
+
+        Options:
+            --comment_id=<comment_id>   : (str) Hash identifying the comment to pin
+            --channel_id=<claim_id>                     : (str) The ID of channel owning the commented claim
+            --channel_name=<claim_name>                 : (str) The name of channel owning the commented claim
+            --remove                                    : (bool) remove the pin
+            --channel_account_id=<channel_account_id>   : (str) one or more account ids for accounts to look in
+            --wallet_id=<wallet_id                      : (str) restrict operation to specific wallet
+
+        Returns: lists containing the ids comments that are hidden and visible.
+
+            {
+                "hidden":   (list) IDs of hidden comments.
+                "visible":  (list) IDs of visible comments.
+            }
+        """
+        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
+        channel = await self.get_channel_or_error(
+            wallet, channel_account_id, channel_id, channel_name, for_signing=True
+        )
+        comment_pin_args = {
+            'comment_id': comment_id,
+            'channel_name': channel_name,
+            'channel_id': channel_id,
+            'remove': remove,
+        }
+        comment_client.sign_comment(comment_pin_args, channel, sign_comment_id=True)
+        return await comment_client.jsonrpc_post(self.conf.comment_server, 'comment.Pin', comment_pin_args)
+
+    @requires(WALLET_COMPONENT)
+    async def jsonrpc_comment_react(
+            self, comment_ids, channel_name=None, channel_id=None,
+            channel_account_id=None, remove=False, clear_types=None, react_type=None, wallet_id=None):
+        """
+        Create and associate a reaction emoji with a comment using your channel identity.
+
+        Usage:
+            comment_react   (--comment_ids=<comment_ids>)
+                            (--channel_id=<channel_id>)
+                            (--channel_name=<channel_name>)
+                            (--react_type=<react_type>)
+                            [(--remove) | (--clear_types=<clear_types>)]
+                            [--channel_account_id=<channel_account_id>...] [--wallet_id=<wallet_id>]
+
+        Options:
+            --comment_ids=<comment_ids>                 : (str) one or more comment id reacted to, comma delimited
+            --channel_id=<claim_id>                     : (str) The ID of channel reacting
+            --channel_name=<claim_name>                 : (str) The name of the channel reacting
+            --wallet_id=<wallet_id>                     : (str) restrict operation to specific wallet
+            --channel_account_id=<channel_account_id>   : (str) one or more account ids for accounts to look in
+            --react_type=<react_type>                   : (str) name of reaction type
+            --remove                                    : (bool) remove specified react_type
+            --clear_types=<clear_types>                 : (str) types to clear when adding another type
+
+
+        Returns:
+            (dict) Reaction object if successfully made, (None) otherwise
+            {
+            "Reactions": {
+                <comment_id>: {
+                    <reaction_type>: (int) Count for this reaction
+                    ...
+                }
+            }
+        """
+        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
+        channel = await self.get_channel_or_error(
+            wallet, channel_account_id, channel_id, channel_name, for_signing=True
+        )
+
+        react_body = {
+            'comment_ids': comment_ids,
+            'channel_id': channel_id,
+            'channel_name': channel.claim_name,
+            'type': react_type,
+            'remove': remove,
+            'clear_types': clear_types,
+        }
+        comment_client.sign_reaction(react_body, channel)
+
+        response = await comment_client.jsonrpc_post(self.conf.comment_server, 'reaction.React', react_body)
+
+        return response
+
+    @requires(WALLET_COMPONENT)
+    async def jsonrpc_comment_react_list(
+            self, comment_ids, channel_name=None, channel_id=None,
+            channel_account_id=None, react_types=None, wallet_id=None):
+        """
+        List reactions emoji with a claim using your channel identity.
+
+        Usage:
+            comment_react_list  (--comment_ids=<comment_ids>)
+                                [(--channel_id=<channel_id>)(--channel_name=<channel_name>)]
+                                [--react_types=<react_types>]
+
+        Options:
+            --comment_ids=<comment_ids>                 : (str) The comment ids reacted to, comma delimited
+            --channel_id=<claim_id>                     : (str) The ID of channel reacting
+            --channel_name=<claim_name>                 : (str) The name of the channel reacting
+            --wallet_id=<wallet_id>                     : (str) restrict operation to specific wallet
+            --react_types=<react_type>                   : (str) comma delimited reaction types
+
+        Returns:
+            (dict) Comment object if successfully made, (None) otherwise
+            {
+                "my_reactions": {
+                    <comment_id>: {
+                    <reaction_type>: (int) Count for this reaction type
+                    ...
+                    }
+                }
+                "other_reactions": {
+                    <comment_id>: {
+                    <reaction_type>: (int) Count for this reaction type
+                    ...
+                    }
+                }
+            }
+        """
+        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
+        react_list_body = {
+            'comment_ids': comment_ids,
+        }
+        if channel_id:
+            channel = await self.get_channel_or_error(
+                wallet, channel_account_id, channel_id, channel_name, for_signing=True
+            )
+            react_list_body['channel_id'] = channel_id
+            react_list_body['channel_name'] = channel.claim_name
+
+        if react_types:
+            react_list_body['types'] = react_types
+        if channel_id:
+            comment_client.sign_reaction(react_list_body, channel)
+        response = await comment_client.jsonrpc_post(self.conf.comment_server, 'reaction.List', react_list_body)
+        return response
 
     async def broadcast_or_release(self, tx, blocking=False):
         await self.wallet_manager.broadcast_or_release(tx, blocking)

@@ -7,8 +7,6 @@ from binascii import hexlify
 from collections import defaultdict
 from dataclasses import dataclass
 from contextvars import ContextVar
-from concurrent.futures.thread import ThreadPoolExecutor
-from concurrent.futures.process import ProcessPoolExecutor
 from typing import Tuple, List, Union, Callable, Any, Awaitable, Iterable, Dict, Optional
 from datetime import date
 from prometheus_client import Gauge, Counter, Histogram
@@ -18,6 +16,12 @@ from .bip32 import PubKey
 from .transaction import Transaction, Output, OutputScript, TXRefImmutable, Input
 from .constants import TXO_TYPES, CLAIM_TYPES
 from .util import date_to_julian_day
+
+from concurrent.futures.thread import ThreadPoolExecutor  # pylint: disable=wrong-import-order
+if platform.system() == 'Windows' or 'ANDROID_ARGUMENT' or 'KIVY_BUILD' in os.environ:
+    from concurrent.futures.thread import ThreadPoolExecutor as ReaderExecutorClass  # pylint: disable=reimported
+else:
+    from concurrent.futures.process import ProcessPoolExecutor as ReaderExecutorClass
 
 
 log = logging.getLogger(__name__)
@@ -60,12 +64,6 @@ def run_read_only_fetchone(sql, params):
     except (Exception, OSError) as e:
         log.exception('Error running transaction:', exc_info=e)
         raise
-
-
-if platform.system() == 'Windows' or 'ANDROID_ARGUMENT' in os.environ:
-    ReaderExecutorClass = ThreadPoolExecutor
-else:
-    ReaderExecutorClass = ProcessPoolExecutor
 
 
 class AIOSQLite:
@@ -123,7 +121,13 @@ class AIOSQLite:
         if self._closing:
             return
         self._closing = True
-        await asyncio.get_event_loop().run_in_executor(self.writer_executor, self.writer_connection.close)
+
+        def __checkpoint_and_close(conn: sqlite3.Connection):
+            conn.execute("PRAGMA WAL_CHECKPOINT(FULL);")
+            log.info("DB checkpoint finished.")
+            conn.close()
+        await asyncio.get_event_loop().run_in_executor(
+            self.writer_executor, __checkpoint_and_close, self.writer_connection)
         self.writer_executor.shutdown(wait=True)
         self.reader_executor.shutdown(wait=True)
         self.read_ready.clear()
@@ -147,7 +151,7 @@ class AIOSQLite:
             self.waiting_reads_metric.inc()
             self.read_count_metric.inc()
             try:
-                while self.writers:  # more writes can come in while we are waiting for the first
+                while self.writers and not self._closing:  # more writes can come in while we are waiting for the first
                     if not urgent_read and still_waiting and self.urgent_read_done.is_set():
                         #  throttle the writes if they pile up
                         self.urgent_read_done.clear()
@@ -155,6 +159,8 @@ class AIOSQLite:
                     #  wait until the running writes have finished
                     await self.read_ready.wait()
                     still_waiting = True
+                if self._closing:
+                    raise asyncio.CancelledError()
                 return await asyncio.get_event_loop().run_in_executor(
                     self.reader_executor, read_only_fn, sql, parameters
                 )
@@ -197,6 +203,8 @@ class AIOSQLite:
         self.read_ready.clear()
         try:
             async with self.write_lock:
+                if self._closing:
+                    raise asyncio.CancelledError()
                 return await asyncio.get_event_loop().run_in_executor(
                     self.writer_executor, lambda: self.__run_transaction(fun, *args, **kwargs)
                 )
@@ -232,6 +240,8 @@ class AIOSQLite:
         self.read_ready.clear()
         try:
             async with self.write_lock:
+                if self._closing:
+                    raise asyncio.CancelledError()
                 return await asyncio.get_event_loop().run_in_executor(
                     self.writer_executor, self.__run_transaction_with_foreign_keys_disabled, fun, args, kwargs
                 )
@@ -377,14 +387,31 @@ def interpolate(sql, values):
     return sql
 
 
-def constrain_single_or_list(constraints, column, value, convert=lambda x: x):
+def constrain_single_or_list(constraints, column, value, convert=lambda x: x, negate=False):
     if value is not None:
         if isinstance(value, list):
             value = [convert(v) for v in value]
             if len(value) == 1:
-                constraints[column] = value[0]
+                if negate:
+                    constraints[f"{column}__or"] = {
+                        f"{column}__is_null": True,
+                        f"{column}__not": value[0]
+                    }
+                else:
+                    constraints[column] = value[0]
             elif len(value) > 1:
-                constraints[f"{column}__in"] = value
+                if negate:
+                    constraints[f"{column}__or"] = {
+                        f"{column}__is_null": True,
+                        f"{column}__not_in": value
+                    }
+                else:
+                    constraints[f"{column}__in"] = value
+        elif negate:
+            constraints[f"{column}__or"] = {
+                f"{column}__is_null": True,
+                f"{column}__not": convert(value)
+            }
         else:
             constraints[column] = convert(value)
     return constraints
@@ -421,7 +448,7 @@ class SQLiteMixin:
                         return
                 await self.db.executescript('\n'.join(
                     f"DROP TABLE {table};" for table in tables
-                ))
+                ) + '\n' + 'PRAGMA WAL_CHECKPOINT(FULL);' + '\n' + 'VACUUM;')
             await self.db.execute(self.CREATE_VERSION_TABLE)
             await self.db.execute("INSERT INTO version VALUES (?)", (self.SCHEMA_VERSION,))
         await self.db.executescript(self.CREATE_TABLES_QUERY)
@@ -565,7 +592,7 @@ def get_and_reserve_spendable_utxos(transaction: sqlite3.Connection, accounts: L
 
 class Database(SQLiteMixin):
 
-    SCHEMA_VERSION = "1.3"
+    SCHEMA_VERSION = "1.5"
 
     PRAGMAS = """
         pragma journal_mode=WAL;
@@ -1254,13 +1281,16 @@ class Database(SQLiteMixin):
         self.constrain_collections(constraints)
         return self.get_utxo_count(**constraints)
 
-    async def release_all_outputs(self, account):
-        await self.db.execute_fetchall(
-            "UPDATE txo SET is_reserved = 0 WHERE"
-            "  is_reserved = 1 AND txo.address IN ("
-            "    SELECT address from account_address WHERE account = ?"
-            "  )", (account.public_key.address, )
-        )
+    async def release_all_outputs(self, account=None):
+        if account is None:
+            await self.db.execute_fetchall("UPDATE txo SET is_reserved = 0 WHERE is_reserved = 1")
+        else:
+            await self.db.execute_fetchall(
+                "UPDATE txo SET is_reserved = 0 WHERE"
+                "  is_reserved = 1 AND txo.address IN ("
+                "    SELECT address from account_address WHERE account = ?"
+                "  )", (account.public_key.address, )
+            )
 
     def get_supports_summary(self, read_only=False, **constraints):
         return self.get_txos(

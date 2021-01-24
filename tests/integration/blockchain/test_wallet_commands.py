@@ -10,7 +10,7 @@ from lbry.wallet.dewies import dict_values_to_lbc
 class WalletCommands(CommandTestCase):
 
     async def test_wallet_create_and_add_subscribe(self):
-        session = next(iter(self.conductor.spv_node.server.session_mgr.sessions))
+        session = next(iter(self.conductor.spv_node.server.session_mgr.sessions.values()))
         self.assertEqual(len(session.hashX_subs), 27)
         wallet = await self.daemon.jsonrpc_wallet_create('foo', create_account=True, single_key=True)
         self.assertEqual(len(session.hashX_subs), 28)
@@ -43,12 +43,14 @@ class WalletCommands(CommandTestCase):
         )
 
     async def test_wallet_reconnect(self):
+        status = await self.daemon.jsonrpc_status()
+        self.assertEqual(len(status['wallet']['servers']), 1)
+        self.assertEqual(status['wallet']['servers'][0]['port'], 50002)
         await self.conductor.spv_node.stop(True)
         self.conductor.spv_node.port = 54320
         await self.conductor.spv_node.start(self.conductor.blockchain_node)
         status = await self.daemon.jsonrpc_status()
-        self.assertEqual(len(status['wallet']['servers']), 1)
-        self.assertEqual(status['wallet']['servers'][0]['port'], 50002)
+        self.assertEqual(len(status['wallet']['servers']), 0)
         self.daemon.jsonrpc_settings_set('lbryum_servers', ['localhost:54320'])
         await self.daemon.jsonrpc_wallet_reconnect()
         status = await self.daemon.jsonrpc_status()
