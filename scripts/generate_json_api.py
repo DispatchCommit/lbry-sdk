@@ -25,7 +25,8 @@ RETURN_DOCS = {
     'File': encode_file_doc(),
     'Transaction': encode_tx_doc(),
     'Output': encode_txo_doc(),
-    'Address': 'an address in base58'
+    'Address': 'an address in base58',
+    'Dict': 'glorious data in dictionary',
 }
 
 
@@ -336,7 +337,8 @@ class Examples(CommandTestCase):
             'Use the parent_id param to make replies',
             'comment', 'create',
             '--comment="I have photographic evidence confirming Sasquatch exists"',
-            f'--channel_name=@channel', f'--parent_id={comment["comment_id"]}'
+            f'--channel_name=@channel', f'--parent_id={comment["comment_id"]}',
+            f'--claim_id={stream_id}'
         )
 
         await r(

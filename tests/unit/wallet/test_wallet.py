@@ -38,7 +38,7 @@ class TestWalletCreation(AsyncioTestCase):
                     'certificates': {},
                     'name': 'An Account',
                     'ledger': 'lbc_mainnet',
-                    'modified_on': 123.456,
+                    'modified_on': 123,
                     'seed':
                         "carbon smart garage balance margin twelve chest sword toast envelope bottom stomac"
                         "h absent",
@@ -62,7 +62,7 @@ class TestWalletCreation(AsyncioTestCase):
         wallet = Wallet.from_storage(storage, self.manager)
         self.assertEqual(wallet.name, 'Main Wallet')
         self.assertEqual(
-            hexlify(wallet.hash), b'a75913d2e7339c1a9ac0c89d621a4e10fd3a40dc3560dc01f4cf4ada0a0b05b8'
+            hexlify(wallet.hash), b'869acc4660dde0f13784ed743796adf89562cdf79fdfc9e5c6dbea98d62ccf90'
         )
         self.assertEqual(len(wallet.accounts), 1)
         account = wallet.default_account
@@ -73,6 +73,48 @@ class TestWalletCreation(AsyncioTestCase):
         encrypted = wallet.pack('password')
         decrypted = Wallet.unpack('password', encrypted)
         self.assertEqual(decrypted['accounts'][0]['name'], 'An Account')
+
+    def test_no_password_but_encryption_preferred(self):
+        wallet_dict = {
+            'version': 1,
+            'name': 'Main Wallet',
+            'preferences': {
+                "encrypt-on-disk": {
+                    "ts": 1571762543.351794,
+                    "value": True
+                },
+            },
+            'accounts': [
+                {
+                    'certificates': {},
+                    'name': 'An Account',
+                    'ledger': 'lbc_mainnet',
+                    'modified_on': 123,
+                    'seed':
+                        "carbon smart garage balance margin twelve chest sword toast envelope bottom stomac"
+                        "h absent",
+                    'encrypted': False,
+                    'private_key':
+                        'xprv9s21ZrQH143K42ovpZygnjfHdAqSd9jo7zceDfPRogM7bkkoNVv7'
+                        'DRNLEoB8HoirMgH969NrgL8jNzLEegqFzPRWM37GXd4uE8uuRkx4LAe',
+                    'public_key':
+                        'xpub661MyMwAqRbcGWtPvbWh9sc2BCfw2cTeVDYF23o3N1t6UZ5wv3EMm'
+                        'Dgp66FxHuDtWdft3B5eL5xQtyzAtkdmhhC95gjRjLzSTdkho95asu9',
+                    'address_generator': {
+                        'name': 'deterministic-chain',
+                        'receiving': {'gap': 17, 'maximum_uses_per_address': 3},
+                        'change': {'gap': 10, 'maximum_uses_per_address': 3}
+                    }
+                }
+            ]
+        }
+
+        storage = WalletStorage(default=wallet_dict)
+        wallet = Wallet.from_storage(storage, self.manager)
+        self.assertEqual(
+            hexlify(wallet.hash), b'8cc6341885e6ad46f72a17364c65f8441f09e79996c55202196b399c75f8d751'
+        )
+        self.assertFalse(wallet.is_encrypted)
 
     def test_read_write(self):
         manager = WalletManager()

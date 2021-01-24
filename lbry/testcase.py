@@ -23,8 +23,9 @@ from lbry.wallet.orchstr8.node import BlockchainNode, WalletNode
 from lbry.extras.daemon.daemon import Daemon, jsonrpc_dumps_pretty
 from lbry.extras.daemon.components import Component, WalletComponent
 from lbry.extras.daemon.components import (
-    DHT_COMPONENT, HASH_ANNOUNCER_COMPONENT, PEER_PROTOCOL_SERVER_COMPONENT,
-    UPNP_COMPONENT, EXCHANGE_RATE_MANAGER_COMPONENT
+    DHT_COMPONENT,
+    HASH_ANNOUNCER_COMPONENT, PEER_PROTOCOL_SERVER_COMPONENT,
+    UPNP_COMPONENT, EXCHANGE_RATE_MANAGER_COMPONENT, LIBTORRENT_COMPONENT
 )
 from lbry.extras.daemon.componentmanager import ComponentManager
 from lbry.extras.daemon.exchange_rate_manager import (
@@ -320,6 +321,7 @@ class CommandTestCase(IntegrationTestCase):
         self.server_blob_manager = None
         self.server = None
         self.reflector = None
+        self.skip_libtorrent = True
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
@@ -340,6 +342,7 @@ class CommandTestCase(IntegrationTestCase):
         server_tmp_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, server_tmp_dir)
         self.server_config = Config()
+        self.server_config.transaction_cache_size = 10000
         self.server_storage = SQLiteStorage(self.server_config, ':memory:')
         await self.server_storage.open()
 
@@ -389,10 +392,13 @@ class CommandTestCase(IntegrationTestCase):
         conf.fixed_peers = [('127.0.0.1', 5567)]
         conf.known_dht_nodes = []
         conf.blob_lru_cache_size = self.blob_lru_cache_size
+        conf.transaction_cache_size = 10000
         conf.components_to_skip = [
             DHT_COMPONENT, UPNP_COMPONENT, HASH_ANNOUNCER_COMPONENT,
             PEER_PROTOCOL_SERVER_COMPONENT
         ]
+        if self.skip_libtorrent:
+            conf.components_to_skip.append(LIBTORRENT_COMPONENT)
         wallet_node.manager.config = conf
 
         def wallet_maker(component_manager):

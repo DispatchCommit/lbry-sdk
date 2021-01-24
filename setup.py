@@ -34,7 +34,7 @@ setup(
     },
     install_requires=[
         'aiohttp==3.5.4',
-        'aioupnp==0.0.17',
+        'aioupnp==0.0.18',
         'appdirs==1.4.3',
         'certifi>=2018.11.29',
         'colorama==0.3.7',
@@ -46,7 +46,7 @@ setup(
         'msgpack==0.6.1',
         'prometheus_client==0.7.1',
         'ecdsa==0.13.3',
-        'pyyaml==4.2b1',
+        'pyyaml==5.3.1',
         'docopt==0.6.2',
         'hachoir',
         'multidict==4.6.1',
